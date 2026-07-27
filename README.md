@@ -1,123 +1,213 @@
 # ShieldScore
 
-Automated compliance auditing that scans GitHub, GitLab, Bitbucket repos (or any git URL / ZIP upload) against **SOC 2**, **ISO 27001**, **GDPR**, and **DPDP** frameworks. Runs 14 parallel scanners via a LangGraph state machine and produces per-framework scores with an enterprise findings report.
+ShieldScore audits a source-code repository and turns technical security findings into a report organised around SOC 2, ISO 27001, GDPR, and India's DPDP framework. It accepts a GitHub, GitLab, Bitbucket, or other Git URL, as well as a ZIP upload.
 
-Maintainer: Lakshya (<lakshyabhatnagar1@gmail.com>)
+It is a developer-assistance tool, not a certification service or a substitute for a professional security assessment.
 
-## Pipeline
+Maintained by Lakshya.
 
+## What happens during an audit
+
+```text
+Repository URL or ZIP
+        ↓
+Orchestrator prepares a temporary local copy
+        ↓
+Nine scanners run in parallel
+        ↓
+Scanner Merge collects their findings
+        ↓
+Compliance Mapper links findings to controls
+        ↓
+Report Generator calculates scores and writes the summary
 ```
-orchestrator → fan_out → [9 parallel scanners] → scanner_merge (barrier) → compliance_mapper → report_generator
+
+The pipeline has 14 LangGraph nodes: two setup nodes, nine scanners, a merge node, a compliance-mapping node, and a report-generation node. A **node** is one step in the workflow; LangGraph coordinates the order and parallel execution of those steps.
+
+| Area | Scanner | Examples of checks |
+| --- | --- | --- |
+| Application code | Semgrep | insecure patterns, injection risks, XSS, and configuration issues |
+| Dependencies | OSV-Scanner | known vulnerabilities in package dependencies |
+| GitHub configuration | GitHub API | repository visibility and branch-protection signals |
+| Secrets and personal data | Gitleaks and local patterns | credentials, emails, phone numbers, Aadhaar-like values |
+| Repository governance | local files and GitHub data | `SECURITY.md`, `CODEOWNERS`, signing and review signals |
+| Software supply chain | Syft and package metadata | SBOM data, license concerns, stale dependencies |
+| Infrastructure as code | Checkov | Terraform, CloudFormation, and Kubernetes misconfiguration |
+| CI/CD | YAML parser | plaintext secrets and missing pipeline safeguards |
+| Data modelling | schema parsers | potentially sensitive fields and encryption signals |
+
+## Repository layout
+
+```text
+app/
+  graph/          LangGraph workflow, node state, and progress tracking
+  graph/nodes/    individual scanners, mapper, and report generator
+  mapper/         framework control mappings and optional RAG support
+  middleware/     API-key and rate-limit middleware
+  routers/        FastAPI audit endpoints
+  utils/          configuration, Git/ZIP handling, caching, and LLM helpers
+frontend/         Next.js audit dashboard
+tests/            backend unit tests
+scripts/          optional setup and diagnostic scripts
 ```
 
-| Node | Tool | What it checks |
-|------|------|---------------|
-| orchestrator | — | Validates source, clones repo or extracts ZIP |
-| semgrep | Semgrep | SAST: injections, XSS, crypto flaws, Docker misconfigs |
-| osv | OSV-Scanner | Dependency vulnerabilities (CVEs) |
-| github | GitHub API | Public repo, branch protection, org MFA (GitHub-only) |
-| scan_secrets_pii | Gitleaks + regex | Hardcoded secrets, PII (email, phone, Aadhaar, credentials) |
-| scan_repo_governance | Filesystem + API | SECURITY.md, CODEOWNERS, signed commits |
-| scan_sbom_license | Syft + npm/PyPI | Copyleft licenses, stale deps with CVEs |
-| scan_iac_config | Checkov | Terraform/CFN/K8s misconfigs |
-| scan_cicd_security | YAML parser | Plaintext secrets, missing SAST, unsigned publishing |
-| scan_data_classification | Schema parsers | Unencrypted PII fields, sensitive category data (Art. 9) |
-| scanner_merge | — | Barrier: waits for all 9 branches before proceeding |
-| compliance_mapper | Groq + Supabase | Maps findings to controls; deterministic CONTROL_MAP + LLM explanations |
-| report_generator | Groq | Scoring, severity breakdown, grounded executive summary |
+## Requirements
 
-## Quick Start
+- Python 3.11 or newer
+- [uv](https://docs.astral.sh/uv/)
+- Git
+- Node.js 22.13 or newer for the frontend
+- A Groq API key to generate mapped reports
+
+Optional scanners improve coverage but are not required for the server to start: Semgrep, OSV-Scanner, Syft, Checkov, and Gitleaks. If one is not installed, its node reports no findings; that does **not** mean the repository is clean in that area.
+
+## Run locally
+
+### 1. Configure the backend
 
 ```bash
-# Prerequisites: Python 3.11+, uv, git, semgrep, osv-scanner
-cd shieldscore
-
-# Environment
 cp .env.example .env
-# Edit with GROQ_API_KEY (required), GITHUB_TOKEN, SUPABASE_URL/KEY (optional)
+```
 
-# Install + run
+Open `.env` and set at least:
+
+```dotenv
+GROQ_API_KEY=your_groq_key
+# Required when using the frontend on port 3001:
+CORS_ORIGINS=http://localhost:3001
+```
+
+Optional values:
+
+| Variable | Purpose |
+| --- | --- |
+| `GITHUB_TOKEN` | increases GitHub API access and rate limits |
+| `SUPABASE_URL`, `SUPABASE_KEY` | enables the optional cache/vector-store integration |
+| `AUDIT_API_KEY` | protects `/api/*`; leave empty only for local development |
+| `LLM_MODEL` | overrides the default Groq model |
+| `ALLOWED_HOSTS` | accepted HTTP host names in a deployment |
+
+Never commit `.env`. It is ignored by Git; `.env.example` is the safe template.
+
+### 2. Start the backend
+
+```bash
 uv sync
-uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload --port 8000
 ```
 
-## Input Sources
-
-| Source | Endpoint |
-|--------|----------|
-| `https://github.com/owner/repo` | `POST /api/audit/start` |
-| `https://gitlab.com/group/project` | `POST /api/audit/start` |
-| `https://bitbucket.org/workspace/repo` | `POST /api/audit/start` |
-| Any git URL | `POST /api/audit/start` |
-| ZIP upload | `POST /api/audit/upload` (multipart) |
-| Local directory | `POST /api/audit/local` |
-
-## Scoring
-
-```
-Per-framework: max(0, 100 + critical×-20 + high×-10 + medium×-3 + low×-1 + info×0)
-Overall: SOC2×0.35 + ISO27001×0.25 + GDPR×0.25 + DPDP×0.15
-```
-
-## Environment Variables
-
-| Variable | Required | Purpose |
-|----------|----------|---------|
-| `GROQ_API_KEY` | Yes | LLM inference |
-| `GITHUB_TOKEN` | No | Higher rate limits, org-level checks |
-| `SUPABASE_URL` | No | Cache + RAG vector store |
-| `SUPABASE_KEY` | No | Supabase API key |
-| `AUDIT_API_KEY` | Yes in production | Shared access key entered in the frontend |
-| `CORS_ORIGINS` | Yes in production | Comma-separated allowed browser origins |
-| `CORS_ORIGIN_REGEX` | No | Optional regex for Vercel preview origins |
-| `ALLOWED_HOSTS` | Yes in production | Comma-separated accepted HTTP hostnames |
-
-## OCI Deployment
-
-The production container listens on port `8080`. On an OCI VM:
+Confirm that it is running:
 
 ```bash
-cp .env.example .env
-# Fill in secrets, then:
-docker compose -f compose.production.yml up -d --build
+curl http://127.0.0.1:8000/health
 ```
 
-The compose file binds the API to `127.0.0.1:8080`. Put Nginx in front of it
-using `nginx.conf.example`, replace `server_name _;` with your API domain,
-create an `A` record pointing to the OCI public IP, and issue TLS with Certbot:
+### 3. Start the frontend
 
-```bash
-sudo certbot --nginx -d api.your-domain.example
-```
-
-OCI networking must allow inbound TCP `80` and `443`; port `8080` should
-remain private. Set `CORS_ORIGINS` to your frontend URL and `ALLOWED_HOSTS`
-to your API domain before deploying.
-
-Set `AUDIT_API_KEY` to a strong, random value on OCI. Users enter it in the
-frontend, which keeps it in tab-scoped session storage and sends it as the
-`X-API-Key` header. Never put this key in a `VITE_*` variable because those
-values are embedded in the public frontend bundle.
-
-## Optional CLI Tools
-
-Missing tools log warnings but don't crash — the pipeline returns empty findings for that scanner:
-
-| Tool | Install | Scanners affected |
-|------|---------|-------------------|
-| semgrep | `pip install semgrep` | SAST |
-| osv-scanner | [GitHub Releases](https://github.com/google/osv-scanner) | Dependency CVEs |
-| syft | [GitHub Releases](https://github.com/anchore/syft) | SBOM / license |
-| checkov | `pip install checkov` | IaC config |
-| gitleaks | [GitHub Releases](https://github.com/gitleaks/gitleaks) | Secrets |
-
-## Frontend
-
-The Next.js dashboard is in `frontend/`. Run it alongside the backend:
+In a second terminal:
 
 ```bash
 cd frontend
-npm install && npm run dev
+source /Users/dinesh/.nvm/nvm.sh  # only if you use nvm
+nvm use 22
+npm install
+npm run dev -- --port 3001
 ```
 
-See the [frontend README](frontend/README.md) for details.
+Open `http://localhost:3001`. The dashboard calls `http://127.0.0.1:8000` by default. To use another backend address, create `frontend/.env` with:
+
+```dotenv
+NEXT_PUBLIC_API_BASE_URL=https://api.example.com
+```
+
+## Use the dashboard
+
+1. Enter `AUDIT_API_KEY` if the backend has one configured.
+2. Choose **GitHub**, **Git URL**, or **Upload ZIP**.
+3. Supply a public repository URL or select a ZIP file.
+4. Select **Audit**.
+5. Watch node status in the pipeline graph, then filter the completed findings by framework or severity.
+
+The frontend shows a clearly labelled demonstration report if it cannot reach the backend. A real report requires the backend and its configured services/tools.
+
+## API overview
+
+All routes are prefixed with `/api`. When `AUDIT_API_KEY` is configured, send it in the `X-API-Key` header.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/audit/start` | starts an asynchronous URL-based audit |
+| `POST` | `/audit/upload` | uploads a ZIP and starts an audit |
+| `GET` | `/audit/{audit_id}/status` | returns node-level progress |
+| `GET` | `/audit/{audit_id}/results` | returns the completed report |
+| `GET` | `/audit/status` | returns the static graph-node list |
+| `POST` | `/audit` | legacy synchronous audit endpoint |
+
+For `POST /api/audit/start`, use JSON such as:
+
+```json
+{ "repo_url": "https://github.com/owner/repository" }
+```
+
+## Scores and framework mapping
+
+Each framework starts at 100. Findings reduce it by severity:
+
+```text
+critical −20 | high −10 | medium −3 | low −1 | info 0
+```
+
+The overall score is a weighted result:
+
+```text
+SOC 2 × 35% + ISO 27001 × 25% + GDPR × 25% + DPDP × 15%
+```
+
+A mapping is evidence for prioritisation, not proof of legal compliance. Control applicability depends on the organisation, systems, contracts, and jurisdiction.
+
+## Temporary repository handling
+
+The browser does not clone a Git repository. The backend clones or extracts it into the temporary storage of the machine/container where the API is running. Scanner paths are stripped from report output, and normal completion cleans up the temporary directory.
+
+For a production deployment, use ephemeral container storage and a cleanup policy: an unexpected process crash can leave temporary data until the host or platform removes it.
+
+## Test and build
+
+Backend:
+
+```bash
+uv run pytest
+```
+
+Frontend:
+
+```bash
+cd frontend
+source /Users/dinesh/.nvm/nvm.sh
+nvm use 22
+npx tsc --noEmit
+npm run lint
+npm run build
+npm test
+```
+
+## Deploy the backend
+
+The Docker image listens on port `8080`. The production Compose configuration binds it to `127.0.0.1:8080`, so place a reverse proxy such as Nginx in front of it.
+
+```bash
+cp .env.example .env
+# Set production secrets and allowed origins/hosts in .env
+docker compose -f compose.production.yml up -d --build
+```
+
+Use `nginx.conf.example` as the reverse-proxy starting point. Expose only HTTPS through the proxy; keep port `8080` private. Set a strong `AUDIT_API_KEY`, the deployed frontend URL in `CORS_ORIGINS`, and the API domain in `ALLOWED_HOSTS`.
+
+## Useful terms
+
+- **SAST**: static application security testing—checking source code without running it.
+- **SBOM**: software bill of materials—a dependency inventory.
+- **CVE**: a published identifier for a known security vulnerability.
+- **PII**: personally identifiable information, such as an email address or phone number.
+- **IaC**: infrastructure as code—cloud configuration stored as files.
+- **RAG**: retrieval-augmented generation—supplying relevant stored reference material to an LLM before it answers.
