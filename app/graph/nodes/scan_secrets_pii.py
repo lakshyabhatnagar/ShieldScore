@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -7,283 +9,183 @@ import shutil
 import subprocess
 import tempfile
 
+from app.graph.finding_quality import classify_source_context
+from app.graph.secret_context import classify_secret_exposure
 from app.graph.state import AuditState, Finding
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# PII REGEX PATTERNS (v1 — targeted, low false-positive)
-# ---------------------------------------------------------------------------
-
 PII_PATTERNS: list[dict] = [
+    {"name": "email_address", "severity_base": "low", "regex": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")},
+    {"name": "phone_india", "severity_base": "medium", "regex": re.compile(r"(?<![\w+])(?:\+?91[-. ]?)?[6-9]\d{9}(?!\w)")},
+    {"name": "aadhaar_like", "severity_base": "high", "regex": re.compile(r"(?<!\w)[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}(?!\w)")},
+    {"name": "pan_card", "severity_base": "high", "regex": re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")},
+    {"name": "credit_card", "severity_base": "high", "regex": re.compile(r"(?<!\w)\d(?:[ -]?\d){12,18}(?!\w|[ -]?\d)")},
+    {"name": "ip_address", "severity_base": "medium", "regex": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")},
     {
-        "name": "email_address",
-        "finding_type": "pii_in_source",
-        "severity_base": "low",
-        "regex": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
-    },
-    {
-        "name": "phone_india",
-        "finding_type": "pii_in_source",
-        "severity_base": "medium",
-        # +91 9876543210 or 09876543210 (10 digits with optional +91/0 prefix)
-        "regex": re.compile(r"(?:\+?91[-.\s]?)?[6-9]\d{9}"),
-    },
-    {
-        "name": "aadhaar_like",
-        "finding_type": "pii_in_source",
-        "severity_base": "high",
-        # 12 consecutive digits — watch for false positives with long numbers
-        "regex": re.compile(r"\b[2-9]\d{11}\b"),
-    },
-    {
-        "name": "pan_card",
-        "finding_type": "pii_in_source",
-        "severity_base": "high",
-        # 5 uppercase letters + 4 digits + 1 uppercase letter
-        "regex": re.compile(r"\b[A-Z]{5}\d{4}[A-Z]{1}\b"),
-    },
-    {
-        "name": "credit_card",
-        "finding_type": "pii_in_source",
-        "severity_base": "high",
-        # 13-16 digits, optionally grouped by spaces/dashes (basic Luhn-free check)
-        "regex": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
-    },
-    {
-        "name": "ip_address",
-        "finding_type": "pii_in_source",
-        "severity_base": "medium",
-        # IPv4 in test/fixture files
-        "regex": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
-    },
-    {
-        "name": "inline_credential",
-        "finding_type": "pii_in_source",
-        "severity_base": "high",
-        # Matches "password": "somevalue", "secret":"val", etc. in JSON/code.
-        # Requires at least 4 chars after the colon to avoid trivial false matches.
+        "name": "inline_credential", "severity_base": "high",
         "regex": re.compile(
-            r'"(?:password|passwd|secret|api_key|apikey|api_secret'
-            r'|auth_token|access_key|private_key)"\s*:\s*"[^"]{4,}"',
+            r'''(?<!\w)["']?(?P<name>(?:\w+_)?(?:password|passwd|secret|api_key|apikey|api_secret|auth_token|access_token|access_key|private_key)(?:_\w+)?)["']?\s*(?P<assignment>[:=])\s*(?P<quote>["'])(?P<value>(?:\\.|(?!(?P=quote))[^\r\n]){4,})(?P=quote)''',
             re.I,
         ),
     },
 ]
 
-# Directories that reduce severity from high → medium (likely test/fixture data)
-_LOW_SEVERITY_DIRS: tuple = (
-    "test", "tests", "__tests__", "spec", "__spec__",
-    "fixture", "fixtures", "mock", "mocks", "seed", "seeds",
-    "stub", "stubs", "factory", "factories", "sample", "samples",
-    "example", "examples", "demo", "demos",
-)
-
-
-def _is_test_or_fixture(file_path: str) -> bool:
-    """Check if a file path is in a test/fixture/seed directory."""
-    parts = file_path.replace("\\", "/").split("/")
-    return any(d in parts for d in _LOW_SEVERITY_DIRS)
-
-
-def _redact_match(match: re.Match) -> str:
-    """Replace matched secret with a safe truncated form.
-
-    Shows first 4 and last 2 chars of the match; replaces middle with [REDACTED].
-    """
-    raw = match.group()
-    if len(raw) <= 8:
-        return f"{raw[:2]}...[REDACTED]"
-    return f"{raw[:4]}...[REDACTED]{raw[-2:]}"
-
-
-def _redact_text(text: str, pattern: re.Pattern) -> str:
-    """Redact all matches of `pattern` in `text`."""
-    return pattern.sub(lambda m: _redact_match(m), text)
-
-
-# ---------------------------------------------------------------------------
-# PII SCANNER (sync, runs in a thread)
-# ---------------------------------------------------------------------------
-
-def _run_pii_scan(repo_path: str) -> list[Finding]:
-    """Walk all tracked files in repo_path and match PII regex patterns.
-
-    Returns Finding dicts with redacted descriptions.
-    """
-    findings: list[Finding] = []
-
-    if not os.path.isdir(repo_path):
-        logger.warning("PII scan: repo path %s not found", repo_path)
-        return findings
-
-    # Collect files via git ls-files (tracked files only)
-    git_path = shutil.which("git")
-    if not git_path:
-        logger.warning("PII scan: git not found, skipping")
-        return findings
-
-    try:
-        result = subprocess.run(
-            [git_path, "-C", repo_path, "ls-files"],
-            capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode != 0:
-            logger.warning("PII scan: git ls-files failed: %s", result.stderr[:200])
-            return findings
-        tracked_files = [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
-    except Exception as exc:
-        logger.warning("PII scan: git ls-files error: %s", exc)
-        return findings
-
-    for rel_path in tracked_files:
-        full_path = os.path.join(repo_path, rel_path)
-        if not os.path.isfile(full_path):
-            continue
-
-        # Skip binary files and large files (> 1 MB)
-        try:
-            stat = os.stat(full_path)
-            if stat.st_size > 1_048_576:
-                continue
-        except OSError:
-            continue
-
-        try:
-            with open(full_path, encoding="utf-8", errors="ignore") as fh:
-                content = fh.read()
-        except Exception:
-            continue
-
-        is_test = _is_test_or_fixture(rel_path)
-        line_offset = 0
-
-        for pattern_def in PII_PATTERNS:
-            regex = pattern_def["regex"]
-            finding_type = pattern_def["finding_type"]
-            base_severity = pattern_def["severity_base"]
-            # Test/fixture files downgrade: high → medium, medium → low
-            if is_test:
-                if base_severity == "high":
-                    severity = "medium"
-                elif base_severity == "medium":
-                    severity = "low"
-                else:
-                    severity = base_severity
-            else:
-                severity = base_severity
-
-            for match in regex.finditer(content):
-                line_number = content[: match.start()].count("\n") + 1
-                matched_text = match.group()
-
-                # Skip common false positives
-                if _is_false_positive(matched_text, rel_path, content, match):
-                    continue
-
-                redacted = _redact_text(matched_text, regex)
-                snippet_start = max(0, match.start() - 40)
-                snippet_end = min(len(content), match.end() + 40)
-                snippet = content[snippet_start:snippet_end].replace("\n", " ").strip()
-
-                findings.append({
-                    "tool": "secrets_pii",
-                    "severity": severity,
-                    "title": f"PII: {pattern_def['name']} detected",
-                    "description": (
-                        f"PII pattern '{pattern_def['name']}' matched in {rel_path}:{line_number}. "
-                        f"Matched value: {redacted}. "
-                        f"Context: \"{_redact_text(snippet, regex)}\""
-                    ),
-                    "file_path": rel_path,
-                    "rule_id": f"pii_{pattern_def['name']}",
-                    "finding_type": finding_type,
-                })
-
-                line_offset += 1
-
-    logger.info("PII scan found %d findings", len(findings))
-    return findings
-
-
-PLACEHOLDER_EMAILS = {
-    "you@example.com", "user@example.com", "email@example.com",
-    "test@test.com", "example@example.com", "admin@example.com",
-    "name@example.com", "email@domain.com", "user@domain.com",
-    "test@example.com", "your@example.com", "me@example.com",
+_BINARY_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".avif", ".pdf",
+    ".wav", ".mp3", ".mp4", ".ogg", ".flac", ".avi", ".mov", ".webm",
+    ".woff", ".woff2", ".ttf", ".eot", ".zip", ".gz", ".bz2", ".xz", ".7z",
+    ".jar", ".class", ".pyc", ".so", ".dll", ".exe", ".db", ".sqlite", ".wasm",
+    ".tiff", ".tif", ".heic", ".psd", ".rar", ".tar", ".o", ".a", ".dylib", ".bin",
 }
 
 
-def _is_false_positive(matched_text: str, file_path: str, content: str, match: re.Match) -> bool:
-    """Filter out common false positives from PII patterns."""
-    # Skip version strings like "1.2.3.4" or semver
-    if re.match(r"^\d+\.\d+\.\d+\.\d+", matched_text):
-        return True
-    # Skip matches that are part of a hex/commit-hash string.
-    # The matched text itself captures only the phone-like portion (10 digits),
-    # so also check whether surrounding characters are hex.
-    start = match.start()
-    end = match.end()
-    # Look at up to 5 chars before and after for hex context
-    hex_before = sum(1 for i in range(max(0, start - 5), start)
-                     if content[i] in "0123456789abcdefABCDEF")
-    hex_after = sum(1 for i in range(end, min(len(content), end + 5))
-                    if content[i] in "0123456789abcdefABCDEF")
-    if hex_before + hex_after >= 4:
-        return True
-    # Also check if the match itself is long and mostly hex-ish
-    if len(matched_text) >= 12:
-        hex_chars = sum(c in "abcdefABCDEF" for c in matched_text)
-        digit_chars = sum(c.isdigit() for c in matched_text)
-        if hex_chars > 0 and hex_chars + digit_chars >= len(matched_text) * 0.85:
+def _read_source(path: str) -> str | None:
+    if os.path.splitext(path.lower())[1] in _BINARY_EXTENSIONS:
+        return None
+    try:
+        with open(path, "rb") as source:
+            data = source.read(1_048_577)
+        if data.startswith((b"%PDF-", b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"PK\x03\x04", b"\x7fELF", b"MZ", b"wOFF", b"wOF2", b"RIFF", b"OggS", b"ID3")) or data[4:8] == b"ftyp":
+            return None
+        if len(data) > 1_048_576 or b"\0" in data:
+            return None
+        if data and sum(byte < 32 and byte not in (9, 10, 13) for byte in data) / len(data) > 0.01:
+            return None
+        return data.decode("utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+
+def _line_at(content: str, start: int, end: int) -> str:
+    line_end = content.find("\n", end)
+    return content[content.rfind("\n", 0, start) + 1:line_end if line_end >= 0 else len(content)]
+
+
+def _is_false_positive(matched_text: str, file_path: str, content: str, match: re.Match, pattern_name: str = "") -> bool:
+    line = _line_at(content, match.start(), match.end())
+    lower = line.lower()
+    if pattern_name == "inline_credential":
+        prefix = content[content.rfind("\n", 0, match.start()) + 1:match.start()].rstrip()
+        return match.group("assignment") == ":" and bool(prefix) and not prefix.endswith(("{", ","))
+    if "@" in matched_text:
+        address = matched_text.lower()
+        local, domain = address.rsplit("@", 1)
+        if domain in {"example.com", "example.org", "example.net", "test.com", "domain.com"} or domain.endswith(".example"):
             return True
-    # Skip common test IPs
-    if matched_text in ("127.0.0.1", "0.0.0.0", "255.255.255.255", "::1", "localhost"):
-        return True
-    # Skip placeholder/demo email addresses (common in UI templates)
-    if matched_text.lower() in PLACEHOLDER_EMAILS:
-        return True
-    # Skip any email at @example.com — this domain is reserved by RFC 2606
-    # for documentation and examples. jane@example.com is not a real leak.
-    if re.search(r"@example\.com$", matched_text, re.I):
-        return True
-    # Skip emails in placeholder attributes (HTML input placeholders)
-    line_start = max(0, content.rfind("\n", 0, match.start()))
-    line_end = content.find("\n", match.end())
-    if line_end == -1:
-        line_end = len(content)
-    line = content[line_start:line_end].lower()
-    if "placeholder" in line:
-        return True
-    # Skip findings in documentation files when context shows they're
-    # examples, not real credentials. Matches README.md curl examples,
-    # docs/*.md API usage snippets, and similar.
-    ext = os.path.splitext(file_path.lower())[1]
-    if ext in (".md", ".rst", ".txt"):
-        doc_keywords = {"example", "curl", "sample", "demo", "usage",
-                        "illustration", "snippet", "test@", "@example"}
-        if any(kw in line for kw in doc_keywords):
+        if local in {"support", "help", "info", "contact", "sales", "security", "noreply", "no-reply"}:
             return True
-    # Skip IPs in private ranges (common in configs)
-    if re.match(r"^10\.\d+\.\d+\.\d+$", matched_text):
-        return True
-    if re.match(r"^192\.168\.\d+\.\d+$", matched_text):
-        return True
-    if re.match(r"^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$", matched_text):
-        return True
-    # Skip lines that look like code (variable assignments to test values)
-    line_start = content.rfind("\n", 0, match.start())
-    if line_start == -1:
-        line_start = 0
-    line = content[line_start:content.find("\n", match.end())].strip()
-    if line.startswith("//") or line.startswith("#") or line.startswith("/*"):
-        return False  # Don't skip comments — they can contain real PII
+        source = classify_source_context(file_path, content, content[:match.start()].count("\n") + 1)
+        if source in {"legal", "generated_attribution"}:
+            return True
+        if source != "production":
+            headings = re.findall(r"(?m)^#{1,6}\s+(.+)$", content[:match.start()])
+            doc_context = lower + " " + (headings[-1].lower() if headings else "")
+            if re.search(r"\b(?:example|sample|demo|dummy|test|usage|judge)\b", doc_context):
+                return True
+        return "placeholder" in lower
+    if pattern_name == "ip_address":
+        try:
+            address = ipaddress.ip_address(matched_text)
+        except ValueError:
+            return True
+        return not address.is_global or not bool(re.search(r"\b(?:client|customer|user|visitor)[_ -]?(?:ip|address)\b", lower))
+    if pattern_name in {"phone_india", "aadhaar_like", "credit_card"}:
+        digits = re.sub(r"\D", "", matched_text)
+        if len(set(digits)) <= 2 or digits in {"1234567890", "9876543210", "123456789012", "1234567890123456"}:
+            return True
+        before = content[max(0, match.start() - 80):match.start()].split("\n")[-1]
+        after = content[match.end():match.end() + 20]
+        if re.search(r"(?:timestamp|epoch|uploaded_at|created_at|updated_at|hash|checksum|query_key|querykey|numeric_id)[\"']?\s*[:=]\s*[\"']?$", before, re.I):
+            return True
+        if re.match(r"\.(?:png|jpe?g|gif|webp|wav|mp[34]|json)\b", after, re.I) or re.search(r"[?&][\w-]+=$", before):
+            return True
+        if pattern_name == "phone_india":
+            return not (matched_text.startswith("+91") or re.search(r"\b(?:phone|mobile|telephone|tel|contact|whatsapp)(?:_number)?\b", lower))
+        if pattern_name == "aadhaar_like":
+            return not bool(re.search(r"\b(?:aadhaar|aadhar|uidai)(?:_number|_id)?\b", lower))
+        # Luhn-valid substrings can still be coordinates, filenames, or platform IDs.
+        if (
+            content[max(0, match.start() - 1):match.start()] == "."
+            or (content[match.end():match.end() + 1] == "." and content[match.end() + 1:match.end() + 2].isdigit())
+        ):
+            return True
+        token_start, token_end = match.start(), match.end()
+        delimiters = " \t\r\n\"'`<>(){},;[]"
+        while token_start > 0 and content[token_start - 1] not in delimiters:
+            token_start -= 1
+        while token_end < len(content) and content[token_end] not in delimiters:
+            token_end += 1
+        token = content[token_start:token_end]
+        if "://" in token or token.startswith(("/", "www.")) or re.search(r"[-_/]\d{13,19}(?:[-_.]|$)", token):
+            return True
+        if re.search(r"\b(?:[a-z_]*id|timestamp|epoch|[a-z_]*(?:filename|file_name))\b[\"']?\s*[:=]\s*[\"']?$", before, re.I):
+            return True
+        total = sum((digit * 2 - 9 if digit * 2 > 9 else digit * 2) if index % 2 else digit
+                    for index, digit in enumerate(map(int, reversed(digits))))
+        return total % 10 != 0
     return False
 
 
-# ---------------------------------------------------------------------------
-# GITLEAKS SCANNER (sync, runs in a thread)
-# ---------------------------------------------------------------------------
+def _run_pii_scan(repo_path: str) -> list[Finding]:
+    """Inspect tracked text sources and retain only contextual PII evidence."""
+    findings: list[Finding] = []
+    git_path = shutil.which("git")
+    if not os.path.isdir(repo_path) or not git_path:
+        return findings
+    try:
+        result = subprocess.run([git_path, "-C", repo_path, "ls-files", "-z"], capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            logger.warning("PII scan: git ls-files failed with code %s", result.returncode)
+            return findings
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("PII scan: unable to list tracked files")
+        return findings
+
+    for rel_path in filter(None, result.stdout.split("\0")):
+        full_path = os.path.join(repo_path, rel_path)
+        if os.path.commonpath((os.path.realpath(repo_path), os.path.realpath(full_path))) != os.path.realpath(repo_path):
+            continue
+        content = _read_source(full_path)
+        if content is None:
+            continue
+        for pattern in PII_PATTERNS:
+            for match in pattern["regex"].finditer(content):
+                name = pattern["name"]
+                if _is_false_positive(match.group(), rel_path, content, match, name):
+                    continue
+                line_number = content[:match.start()].count("\n") + 1
+                source = classify_source_context(rel_path, content, line_number)
+                raw_severity = pattern["severity_base"]
+                severity = raw_severity
+                if source != "production":
+                    severity = {"high": "medium", "medium": "low"}.get(severity, severity)
+                value = match.group()
+                metadata = {
+                    "raw_severity": raw_severity, "confidence": 0.9,
+                    "applicability": 1.0 if source == "production" else 0.25,
+                }
+                if name == "inline_credential":
+                    value = match.group("value")
+                    metadata = classify_secret_exposure(match.group("name"), value, context=_line_at(content, match.start(), match.end()), source_context=source)
+                    if metadata["exposure_classification"] in {"placeholder", "identifier", "false_positive"}:
+                        continue
+                    severity = metadata["severity"]
+                findings.append({
+                    "tool": "secrets_pii", "severity": severity,
+                    "title": f"PII: {name} detected",
+                    "description": f"PII pattern '{name}' matched in {rel_path}:{line_number}. Matched value: [REDACTED].",
+                    "file_path": rel_path, "line_number": line_number,
+                    "column": match.start() - content.rfind("\n", 0, match.start()),
+                    "rule_id": f"pii_{name}",
+                    "finding_type": "hardcoded_secret" if name == "inline_credential" else "pii_in_source",
+                    "sources": ["pii_regex"], "source_context": source,
+                    ("secret_hash" if name == "inline_credential" else "match_hash"): hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                    **metadata,
+                })
+    logger.info("PII scan found %d findings", len(findings))
+    return findings
+
 
 def _find_gitleaks() -> str | None:
     """Resolve gitleaks binary path."""
@@ -343,19 +245,14 @@ def _run_gitleaks_scan(repo_path: str) -> list[Finding]:
                 len(stdout),
                 len(stderr),
             )
-            if stdout:
-                logger.debug("Gitleaks stdout preview: %s", stdout[:500])
-            if stderr:
-                logger.debug("Gitleaks stderr preview: %s", stderr[:500])
 
             # Gitleaks normally exits 1 when leaks are found and 0 when none
             # are found. Parse the report for either code because behavior can
             # differ between versions.
             if result.returncode not in (0, 1):
                 logger.warning(
-                    "Gitleaks failed with exit code %s: %s",
+                    "Gitleaks failed with exit code %s",
                     result.returncode,
-                    stderr[:500],
                 )
                 return []
 
@@ -372,7 +269,7 @@ def _run_gitleaks_scan(repo_path: str) -> list[Finding]:
                 with open(report_path, encoding="utf-8") as report_file:
                     leaks = json.load(report_file)
             except (OSError, json.JSONDecodeError) as exc:
-                logger.warning("Gitleaks: failed to read JSON report: %s", exc)
+                logger.warning("Gitleaks: failed to read JSON report (%s)", type(exc).__name__)
                 return []
     except subprocess.TimeoutExpired:
         logger.warning("Gitleaks scan timed out after 300s")
@@ -381,7 +278,7 @@ def _run_gitleaks_scan(repo_path: str) -> list[Finding]:
         logger.warning("Gitleaks binary not found at %s", gitleaks)
         return []
     except Exception as exc:
-        logger.warning("Gitleaks scan failed: %s", exc)
+        logger.warning("Gitleaks scan failed (%s)", type(exc).__name__)
         return []
 
     findings: list[Finding] = []
@@ -397,37 +294,38 @@ def _run_gitleaks_scan(repo_path: str) -> list[Finding]:
         start_line = leak.get("StartLine") or leak.get("start_line", 0)
         commit = (leak.get("Commit") or leak.get("commit", ""))[:8]
         secret = leak.get("Secret") or leak.get("secret", "") or ""
-        author = (leak.get("Author") or leak.get("author", "") or "")
-
-        # Determine finding_type from the gitleaks rule
+        match_context = str(leak.get("Match") or leak.get("match") or "")
+        source_path = os.path.join(repo_path, file_path)
+        content = ""
+        if os.path.commonpath((os.path.realpath(repo_path), os.path.realpath(source_path))) == os.path.realpath(repo_path):
+            content = _read_source(source_path) or ""
+        try:
+            start_line = max(0, int(start_line))
+        except (TypeError, ValueError):
+            start_line = 0
+        if not match_context and start_line and start_line <= len(content.splitlines()):
+            match_context = content.splitlines()[start_line - 1]
+        name = match_context.split("=", 1)[0].split(":", 1)[0]
+        metadata = classify_secret_exposure(name, secret, rule_id, match_context,
+                                            classify_source_context(file_path, content, start_line))
+        if metadata["exposure_classification"] in {"placeholder", "identifier", "false_positive"}:
+            continue
         finding_type = _classify_gitleaks_rule(rule_id, description, secret)
-
-        # Determine severity: committed secrets are always at least high
-        if finding_type in ("jwt_exposed", "private_key_exposed", "cloud_credentials_exposed"):
-            severity = "critical"
-        elif finding_type == "hardcoded_secret":
-            severity = "critical"
-        else:
-            severity = "high"
-
-        # Redact the secret from output
-        redacted_secret = f"{secret[:4]}...[REDACTED]{secret[-2:]}" if len(secret) > 6 else "[REDACTED]"
-
-        desc = (
-            f"Secret detected by gitleaks: {description} "
-            f"in {file_path}:{start_line} "
-            f"(commit: {commit}, author: {author}). "
-            f"Matched value: {redacted_secret}"
-        )
-
         findings.append({
             "tool": "secrets_pii",
-            "severity": severity,
             "title": f"Secret: {rule_id}",
-            "description": desc,
+            "description": (
+                f"Secret detected by gitleaks in {file_path}:{start_line} "
+                f"(commit: {commit}). Matched value: [REDACTED]."
+            ),
             "file_path": file_path,
+            "line_number": start_line,
             "rule_id": f"gitleaks_{rule_id}",
             "finding_type": finding_type,
+            "sources": ["gitleaks"],
+            "source_context": classify_source_context(file_path, content, start_line),
+            "secret_hash": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+            **metadata,
         })
 
     logger.info("Gitleaks found %d findings", len(findings))
@@ -492,6 +390,5 @@ async def run_scan_secrets_pii(state: AuditState) -> dict:
                      len(gitleaks_findings), len(pii_findings), len(all_findings))
         return {"secrets_findings": all_findings}
     except Exception as exc:
-        err_text = str(exc) or "Unknown error"
-        logger.error("Secrets+PII scan failed: %s", err_text)
+        logger.error("Secrets+PII scan failed (%s)", type(exc).__name__)
         return {"secrets_findings": []}

@@ -1,10 +1,15 @@
 import asyncio
 import json
 import logging
+import hashlib
+import os
+import re
 import shutil
 import subprocess
 
 from app.graph.state import AuditState, Finding
+from app.graph.finding_quality import classify_source_context
+from app.graph.secret_context import classify_secret_exposure
 
 logger = logging.getLogger(__name__)
 
@@ -79,14 +84,67 @@ def _run_semgrep_sync(repo_path: str) -> list[Finding]:
     for sem_result in data.get("results", []):
         extra = sem_result.get("extra", {})
         raw_severity = extra.get("severity", "warning")
+        metadata = extra.get("metadata") or {}
+        line = (sem_result.get("start") or {}).get("line", 0)
+        column = (sem_result.get("start") or {}).get("col", 0)
+        path = sem_result.get("path") or ""
+        content = ""
+        try:
+            full_path = os.path.abspath(os.path.join(repo_path, path))
+            if os.path.commonpath([os.path.abspath(repo_path), full_path]) == os.path.abspath(repo_path):
+                with open(full_path, encoding="utf-8") as source:
+                    content = source.read(1_048_576)
+        except (OSError, UnicodeError, ValueError):
+            pass
+        source_context = classify_source_context(path, content, line)
+        confidence = {"HIGH": 1.0, "MEDIUM": 0.75, "LOW": 0.4}.get(str(metadata.get("confidence", "HIGH")).upper(), 1.0)
+        observation = "likely_vulnerability"
+        if metadata.get("category") in ("best-practice", "maintainability") or "audit" in (metadata.get("subcategory") or []) or re.search(r"(?:manual.*saniti[sz]|unsafe.format|audit)", sem_result["check_id"], re.I):
+            confidence = min(confidence, 0.35)
+            observation = "hardening_recommendation"
+        quality = {
+            "raw_severity": raw_severity,
+            "line_number": line,
+            "column": column,
+            "source_context": source_context,
+            "confidence": confidence,
+            "applicability": 0.25 if source_context != "production" else 1.0,
+            "assessment": observation,
+            "sources": ["semgrep"],
+            "scanner_metadata": {k: metadata[k] for k in ("confidence", "category", "subcategory", "impact", "likelihood", "technology") if k in metadata},
+        }
+        description = extra.get("message", "")
+        rule_id = sem_result["check_id"]
+        if re.search(r"(?:jwt|hardcoded|secret|private.key|api.key)", rule_id, re.I):
+            description = "Credential candidate detected by Semgrep; matched value redacted."
+            lines = content.splitlines()
+            source_line = lines[line - 1] if 0 < line <= len(lines) else ""
+            assignment = re.search(
+                r"[\"']?([A-Za-z_]\w*)[\"']?\s*[:=]\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s,;{}\[\]()\"']+))",
+                source_line,
+            )
+            if assignment:
+                name = assignment.group(1)
+                value = next(v for v in assignment.groups()[1:] if v is not None)
+                exposure = classify_secret_exposure(name, value, rule_id, source_line, source_context)
+                if exposure["exposure_classification"] in {"placeholder", "identifier", "false_positive"}:
+                    continue
+                quality.update(exposure)
+                quality["raw_severity"] = raw_severity
+                quality["secret_hash"] = hashlib.sha256(value.encode()).hexdigest()
+                quality["finding_type"] = "jwt_exposed" if value.startswith("eyJ") else "hardcoded_secret"
+                quality["assessment"] = "confirmed_vulnerability" if exposure["secret_class"] == "private_service_token" else "likely_vulnerability"
+                quality["column"] = 0
+                description = "Credential candidate detected by Semgrep; matched value redacted."
         findings.append(
             {
                 "tool": "semgrep",
                 "severity": _map_severity(raw_severity),
                 "title": sem_result["check_id"],
-                "description": extra.get("message", ""),
+                "description": description,
                 "file_path": sem_result.get("path"),
                 "rule_id": sem_result["check_id"],
+                **quality,
             }
         )
 

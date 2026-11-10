@@ -33,68 +33,67 @@ def _run_osv_sync(repo_path: str) -> list[Finding]:
 
     data = json.loads(stdout_str)
 
-    # Group vulnerabilities by package to deduplicate noisy multi-CVE findings
-    SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
-    packages: dict[str, dict] = {}
-
+    severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+    packages: dict[tuple, dict] = {}
     for scan_result in data.get("results", []):
         for pkg in scan_result.get("packages", []):
-            pkg_name = (pkg.get("package") or {}).get("name") or "unknown"
-            if pkg_name not in packages:
-                packages[pkg_name] = {
-                    "max_severity": "info",
-                    "max_severity_score": 0,
-                    "vulns": [],
-                    "purl": (pkg.get("package") or {}).get("purl", ""),
-                }
-
+            package = pkg.get("package") or {}
+            key = (package.get("ecosystem", ""), package.get("name", "unknown"), package.get("version", ""))
+            info = packages.setdefault(key, {"advisories": {}, "paths": set(), "scopes": set(), "direct": set()})
+            source_path = (scan_result.get("source") or {}).get("path")
+            if source_path:
+                info["paths"].add(source_path)
+            groups = pkg.get("dependency_groups") or []
+            info["scopes"].update(str(g).lower() for g in groups)
+            if isinstance(pkg.get("is_direct"), bool):
+                info["direct"].add(pkg["is_direct"])
             for vuln in pkg.get("vulnerabilities", []):
-                sev = _severity(vuln)
-                sev_score = SEVERITY_RANK.get(sev, 0)
-                if sev_score > packages[pkg_name]["max_severity_score"]:
-                    packages[pkg_name]["max_severity"] = sev
-                    packages[pkg_name]["max_severity_score"] = sev_score
-                packages[pkg_name]["vulns"].append(vuln)
+                if vuln.get("id"):
+                    info["advisories"].setdefault(vuln["id"], []).append(vuln)
 
     findings: list[Finding] = []
-    for pkg_name, info in packages.items():
-        vulns = info["vulns"]
-        if len(vulns) == 1:
-            v = vulns[0]
-            findings.append(
-                {
-                    "tool": "osv",
-                    "severity": info["max_severity"],
-                    "title": v["id"],
-                    "description": v.get("summary", v["id"]),
-                    "file_path": None,
-                    "rule_id": v["id"],
-                }
-            )
-        else:
-            # Group multiple CVEs for the same package into one finding
-            cve_ids = [v["id"] for v in vulns]
-            summaries = [v.get("summary", "") for v in vulns if v.get("summary")]
-            # Use the most descriptive summary as the "title" description
-            top_cves = cve_ids[:3]
-            others_count = len(cve_ids) - 3
-            cve_list = ", ".join(top_cves)
-            if others_count > 0:
-                cve_list += f" (+{others_count} more)"
-
-            findings.append(
-                {
-                    "tool": "osv",
-                    "severity": info["max_severity"],
-                    "title": f"{pkg_name}: {len(vulns)} known vulnerabilities",
-                    "description": (
-                        f"{pkg_name} has {len(vulns)} known CVEs: {cve_list}. "
-                        f"{'Includes: ' + '; '.join(summaries[:2]) if summaries else ''}"
-                    ),
-                    "file_path": None,
-                    "rule_id": f"osv_{pkg_name}",
-                }
-            )
+    for (ecosystem, name, version), info in packages.items():
+        # Alias-connected records are one advisory, including GHSA/CVE duplicates.
+        records: list[dict] = []
+        vulnerabilities = [v for group in info["advisories"].values() for v in group]
+        for vuln in sorted(vulnerabilities, key=lambda v: (v["id"], _severity(v))):
+            ids = {vuln["id"], *vuln.get("aliases", [])}
+            matches = [r for r in records if ids & set(r["aliases"])]
+            severity = _severity(vuln)
+            summaries = [vuln.get("summary") or vuln.get("details") or vuln["id"]]
+            for record in matches:
+                ids.update(record["aliases"])
+                summaries.extend(record["summaries"])
+                if severity_rank[record["severity"]] > severity_rank[severity]:
+                    severity = record["severity"]
+                records.remove(record)
+            records.append({"id": min(ids), "aliases": sorted(ids), "severity": severity, "summaries": sorted(set(summaries))})
+        if not records:
+            continue
+        records.sort(key=lambda r: r["id"])
+        severity = max((r["severity"] for r in records), key=severity_rank.get)
+        dev_only = bool(info["scopes"]) and info["scopes"] <= {"dev", "development", "test", "build"}
+        findings.append({
+            "tool": "osv",
+            "severity": severity,
+            "raw_severity": severity,
+            "title": records[0]["id"] if len(records) == 1 else f"{name}: {len(records)} known vulnerabilities",
+            "description": f"{name}@{version}: " + "; ".join(f"{r['id']}: {'; '.join(r['summaries'])}" for r in records),
+            "file_path": None,
+            "rule_id": records[0]["id"] if len(records) == 1 else f"osv_{name}",
+            "package": name,
+            "package_version": version,
+            "ecosystem": ecosystem,
+            "advisories": records,
+            "dependency_scope": "development" if dev_only else "runtime" if "runtime" in info["scopes"] else "unknown",
+            "direct_dependency": True if True in info["direct"] else False if info["direct"] else None,
+            "manifest_paths": sorted(info["paths"]),
+            "confidence": 1.0,
+            "applicability": 0.4 if dev_only else 0.75,
+            "quality_reason": "Known advisory; runtime reachability is not established by OSV.",
+            "personal_data_relevance": "unknown",
+            "sources": ["osv"],
+        })
 
     if result.returncode != 0 and stderr_str:
         logger.info(
