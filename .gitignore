@@ -3,6 +3,14 @@
 .env.*
 !.env.example
 
+# Local credentials, agent state, and working notes
+.aws/
+.codex/
+.audit/
+
+# JavaScript dependencies
+node_modules/
+
 # Virtual environments
 .venv/
 venv/
