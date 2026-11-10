@@ -4,6 +4,7 @@ import logging
 from groq import AsyncGroq
 
 from app.graph.state import AuditState, MappedControl
+from app.graph.finding_quality import canonicalize_findings
 from app.utils.config import GROQ_API_KEY, LLM_MODEL
 from app.utils.llm import groq_retry
 
@@ -134,19 +135,8 @@ def _group_by_framework(mapped_controls: list[MappedControl]) -> dict:
 
 def _severity_breakdown(mapped_controls: list[MappedControl]) -> dict:
     breakdown = {severity: 0 for severity in SEVERITIES}
-    seen_findings: set[tuple[str, str, str]] = set()
-
-    for mapped_control in mapped_controls:
-        finding = mapped_control["finding"]
-        finding_key = (
-            finding.get("tool", ""),
-            finding.get("rule_id") or finding.get("title", ""),
-            finding.get("description", ""),
-        )
-        if finding_key in seen_findings:
-            continue
-        seen_findings.add(finding_key)
-
+    findings = canonicalize_findings([mc["finding"] for mc in mapped_controls])
+    for finding in findings:
         severity = finding.get("severity", "").lower()
         if severity in breakdown:
             breakdown[severity] += 1
@@ -155,41 +145,29 @@ def _severity_breakdown(mapped_controls: list[MappedControl]) -> dict:
 
 
 def _per_framework_scores(mapped_controls: list[MappedControl]) -> dict[str, int]:
-    """Compute a compliance score per framework, independently deduplicated."""
-    per_fw_breakdown: dict[str, dict[str, int]] = {
-        fw: {"critical": 0, "high": 0, "medium": 0, "low": 0}
-        for fw in FRAMEWORKS
-    }
-    # Per-framework seen set so the same finding counts toward each framework
-    fw_seen: dict[str, set[tuple[str, str, str]]] = {
-        fw: set() for fw in FRAMEWORKS
-    }
-
-    for mc in mapped_controls:
-        framework = mc.get("framework", "")
-        if framework not in per_fw_breakdown:
-            continue
-        finding = mc["finding"]
-        key = (
-            finding.get("tool", ""),
-            finding.get("rule_id") or finding.get("title", ""),
-            finding.get("description", ""),
-        )
-        if key in fw_seen[framework]:
-            continue
-        fw_seen[framework].add(key)
-        severity = finding.get("severity", "").lower()
-        if severity in per_fw_breakdown[framework]:
-            per_fw_breakdown[framework][severity] += 1
-
+    """Deduct once per canonical issue and framework, weighted by evidence quality."""
     scores = {}
-    for framework, breakdown in per_fw_breakdown.items():
-        deduction = sum(
-            SEVERITY_WEIGHTS[sev] * count for sev, count in breakdown.items()
-        )
-        scores[framework] = max(0, 100 + deduction)
-
+    for framework in FRAMEWORKS:
+        weighted_findings = []
+        for mapped in mapped_controls:
+            if mapped.get("framework") != framework:
+                continue
+            finding = dict(mapped["finding"])
+            for factor in ("confidence", "applicability"):
+                if factor in mapped:
+                    finding[factor] = min(finding.get(factor, 1.0), mapped[factor])
+            weighted_findings.append(finding)
+        findings = canonicalize_findings(weighted_findings)
+        deduction = sum(effective_penalty(f) for f in findings)
+        scores[framework] = max(0, round(100 - deduction))
     return scores
+
+
+def effective_penalty(finding: dict) -> float:
+    weight = -SEVERITY_WEIGHTS.get(finding.get("severity", "info").lower(), 0)
+    confidence = min(1.0, max(0.0, finding.get("confidence", 1.0)))
+    applicability = min(1.0, max(0.0, finding.get("applicability", 1.0)))
+    return weight * confidence * applicability
 
 
 def _weighted_score(framework_scores: dict[str, int]) -> int:

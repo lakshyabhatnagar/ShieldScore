@@ -3,10 +3,10 @@ import logging
 from functools import lru_cache
 
 from groq import AsyncGroq
-from sentence_transformers import SentenceTransformer
 from supabase import create_client
 
 from app.graph.state import Finding, MappedControl
+from app.mapper.controls import _classify_finding_type
 from app.utils.config import GROQ_API_KEY, LLM_MODEL, SUPABASE_KEY, SUPABASE_URL
 from app.utils.llm import groq_retry
 
@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
-def _get_model() -> SentenceTransformer:
+def _get_model():
     """Lazy-loaded SentenceTransformer singleton.
 
     Loaded only when first needed (not at import time), preserving ~200MB RAM
     when Supabase is not configured.
     """
+    from sentence_transformers import SentenceTransformer
+
     return SentenceTransformer("BAAI/bge-base-en-v1.5")
 
 
@@ -75,7 +77,7 @@ async def enrich_gdpr_dpdp_explanations(
     Falls back to the original curated explanations if anything fails.
     """
     supabase = _get_supabase()
-    if supabase is None:
+    if supabase is None or not GROQ_API_KEY:
         return None
 
     client = AsyncGroq(api_key=GROQ_API_KEY)
@@ -92,12 +94,6 @@ async def enrich_gdpr_dpdp_explanations(
     if not any(control_texts.values()):
         return None
 
-    # Build a finding lookup by rule_id for description context
-    findings_by_rule: dict[str, Finding] = {}
-    for f in findings:
-        rid = f.get("rule_id") or ""
-        findings_by_rule[rid] = f
-
     # Enrich each control with a grounded explanation
     enriched: list[MappedControl] = []
     for mc in curated_controls:
@@ -110,21 +106,18 @@ async def enrich_gdpr_dpdp_explanations(
             continue
 
         finding = mc.get("finding", {})
-        description = finding.get("description", "") or ""
-        title = finding.get("title", "") or ""
-
-        if not description and not title:
-            enriched.append(mc)
-            continue
+        category = _classify_finding_type(
+            finding.get("rule_id") or "", finding.get("description", ""), finding.get("finding_type")
+        )
 
         try:
             prompt = (
                 f"You are a compliance expert. Explain in 2 sentences how this security "
                 f"finding relates to the {fw.upper()} provision below.\n\n"
-                f"Security finding: {title} — {description}\n\n"
+                f"Finding category: {category}. Personal-data relevance: {mc.get('personal_data_relevance', 'unknown')}.\n\n"
                 f"Relevant {fw.upper()} provision ({cid}):\n{reg_text}\n\n"
                 f"Write a specific, technically-grounded explanation that references the "
-                f"provision text. Be concrete about how the finding violates the requirement."
+                f"provision text. Describe a potential gap requiring review; do not assert a proven violation."
             )
             resp = await groq_retry(
                 lambda: client.chat.completions.create(
@@ -136,7 +129,8 @@ async def enrich_gdpr_dpdp_explanations(
             new_explanation = resp.choices[0].message.content or ""
             if new_explanation:
                 mc = dict(mc)  # copy so we don't mutate input
-                mc["explanation"] = new_explanation
+                mc["explanation"] = new_explanation[:1200]
+                mc["sources"] = list(mc.get("sources", [])) + [f"regulation:{cid}"]
         except Exception:
             pass  # Keep original curated explanation
 

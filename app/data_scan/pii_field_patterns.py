@@ -73,48 +73,23 @@ WEAK_IDENTIFIERS: set[str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Special category data — GDPR Art. 9 / DPDP Rule 4 classifications.
+# Special category indicators under GDPR Article 9. DPDP has no equivalent category.
 # These are flagged regardless of encryption status because they're
 # inherently higher-risk under data protection law.
 # ---------------------------------------------------------------------------
 
 SENSITIVE_CATEGORIES: list[dict] = [
-    {"keyword": "health", "label": "Health data",
-     "description": "Health or medical information (GDPR Art. 9(a))"},
-    {"keyword": "medical", "label": "Medical data",
-     "description": "Medical records or health information"},
-    {"keyword": "diagnosis", "label": "Medical diagnosis",
-     "description": "Medical diagnosis or treatment information"},
-    {"keyword": "biometric", "label": "Biometric data",
-     "description": "Biometric data used for identification (GDPR Art. 9(d))"},
-    {"keyword": "fingerprint", "label": "Fingerprint data",
-     "description": "Fingerprint template or image"},
-    {"keyword": "genetic", "label": "Genetic data",
-     "description": "Genetic or genomic data (GDPR Art. 9(c))"},
-    {"keyword": "dna", "label": "DNA data",
-     "description": "DNA sequencing or profile data"},
-    {"keyword": "religion", "label": "Religious affiliation",
-     "description": "Religious or philosophical beliefs (GDPR Art. 9(b))"},
-    {"keyword": "caste", "label": "Caste data",
-     "description": "Caste affiliation (sensitive under Indian law)"},
-    {"keyword": "sexual_orientation", "label": "Sexual orientation",
-     "description": "Sexual orientation data (GDPR Art. 9(e))"},
-    {"keyword": "sexual_orientation", "label": "Sexual orientation",
-     "description": "Sexual orientation data"},
-    {"keyword": "political", "label": "Political opinion",
-     "description": "Political opinions or party affiliation (GDPR Art. 9(e))"},
-    {"keyword": "union", "label": "Trade union membership",
-     "description": "Trade union membership (GDPR Art. 9(f))"},
-    {"keyword": "criminal", "label": "Criminal record",
-     "description": "Criminal conviction or record data"},
-    {"keyword": "password", "label": "Password / credential",
-     "description": "Password or authentication credential (also caught by secrets scanner)"},
-
-    # Combined / catch-all patterns
-    {"keyword": "sensitive_", "label": "Sensitive data field",
-     "description": "Field marked as sensitive"},
-    {"keyword": "protected_", "label": "Protected data field",
-     "description": "Field marked as protected"},
+    {"keyword": keyword, "label": label, "description": label}
+    for keyword, label in [
+        ("health", "Health data"), ("medical", "Medical data"),
+        ("diagnosis", "Medical diagnosis"), ("biometric", "Biometric identification data"),
+        ("fingerprint", "Fingerprint identification data"), ("genetic", "Genetic data"),
+        ("dna", "DNA data"), ("religion", "Religious beliefs"),
+        ("ethnicity", "Ethnic origin"), ("racial_origin", "Racial origin"),
+        ("philosophical_beliefs", "Philosophical beliefs"),
+        ("sexual_orientation", "Sexual orientation"), ("sex_life", "Sex life"),
+        ("political", "Political opinions"), ("trade_union", "Trade union membership"),
+    ]
 ]
 
 

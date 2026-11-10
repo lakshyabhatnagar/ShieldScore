@@ -548,12 +548,14 @@ async def run_scan_data_classification(state: AuditState) -> dict:
                     "description": (
                         f"Model '{model['name']}' in {rel_path} contains "
                         f"special-category data fields: {', '.join(pii_set)}. "
-                        f"GDPR Art. 9 / DPDP Rule 4 require additional "
-                        f"safeguards for this data even if encrypted."
+                        f"Review GDPR Article 9 applicability and the conditions for "
+                        f"processing these fields, including their actual use."
                     ),
                     "file_path": rel_path,
                     "rule_id": f"dc_sensitive_{model['name'].lower()}",
                     "finding_type": "sensitive_category_data_detected",
+                    "personal_data_relevance": "confirmed",
+                    "confidence": 0.8,
                 })
 
             # Unencrypted PII (only if no encryption signal)
@@ -577,6 +579,8 @@ async def run_scan_data_classification(state: AuditState) -> dict:
                     "file_path": rel_path,
                     "rule_id": f"dc_unencrypted_{model['name'].lower()}",
                     "finding_type": "pii_field_unencrypted",
+                    "personal_data_relevance": "confirmed",
+                    "confidence": 0.7,
                 })
 
     logger.info("Data classification: %d findings from %d models",

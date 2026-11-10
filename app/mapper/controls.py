@@ -5,6 +5,7 @@ import re
 from groq import AsyncGroq
 
 from app.graph.state import Finding, MappedControl
+from app.graph.finding_quality import finding_fingerprint
 from app.utils.config import GROQ_API_KEY, LLM_MODEL
 from app.utils.llm import groq_retry, strip_markdown_fences
 
@@ -53,6 +54,8 @@ RAW_CONTROL_MAP: dict[str, list[str]] = {
     "weak_hash": ["SOC2:CC6.7", "ISO:A.10.1.1", "GDPR:Art. 32", "DPDP:Rule 8"],
     "weak_rng": ["SOC2:CC6.7", "ISO:A.10.1.1"],
     "hardcoded_crypto_key": ["SOC2:CC6.7", "ISO:A.10.1.2", "GDPR:Art. 32", "DPDP:Rule 8"],
+    "crypto_misuse": ["SOC2:CC6.7", "ISO:A.10.1.1", "GDPR:Art. 32", "DPDP:Rule 8"],
+    "general_security": ["SOC2:CC7.1", "ISO:A.12.6.1"],
     "weak_cipher": ["SOC2:CC6.7", "ISO:A.10.1.1", "GDPR:Art. 32", "DPDP:Rule 8"],
     "missing_sri": ["SOC2:CC7.1", "ISO:A.12.5.1"],
     # ------------------------------------------------------------------ #
@@ -142,7 +145,7 @@ RAW_CONTROL_MAP: dict[str, list[str]] = {
     # DATA CLASSIFICATION                                                 #
     # ------------------------------------------------------------------ #
     "pii_field_unencrypted":              ["SOC2:CC6.7", "ISO:A.10.1.1", "GDPR:Art. 32", "DPDP:Rule 8"],
-    "sensitive_category_data_detected":   ["SOC2:CC6.7", "ISO:A.10.1.1", "GDPR:Art. 9", "DPDP:Rule 4"],
+    "sensitive_category_data_detected":   ["SOC2:CC6.7", "ISO:A.10.1.1", "GDPR:Art. 9", "DPDP:Rule 8"],
     # ------------------------------------------------------------------ #
     # IaC / CONFIG                                                        #
     # ------------------------------------------------------------------ #
@@ -193,6 +196,7 @@ _CONTROL_NAMES: dict[str, str] = {
     "A.13.1.2": "Security of Network Services",
     # GDPR + DPDP
     "gdpr_article_32": "Security of Processing",
+    "gdpr_article_9": "Processing of Special Categories of Personal Data",
     "dpdp_rule_8": "Security Safeguards",
 }
 
@@ -424,8 +428,10 @@ _CLASSIFICATION_RULES: list[tuple[str, dict]] = [
     ("weak_hash", {"rule_id_contains": "use-sha1"}),
     ("weak_rng", {"rule_id_contains": ".Random"}),
     ("weak_rng", {"rule_id_contains": "random"}),
-    ("weak_cipher", {"rule_id_contains": "crypto"}),
-    ("weak_cipher", {"rule_id_contains": "des"}),
+    ("crypto_misuse", {"rule_id_contains": "gcm"}),
+    ("crypto_misuse", {"rule_id_contains": "nonce"}),
+    ("crypto_misuse", {"rule_id_contains": "crypto"}),
+    ("weak_cipher", {"rule_id_pattern": r"(?:^|[._-])(?:des|3des|desede)(?:$|[._-])"}),
     ("weak_cipher", {"rule_id_contains": "rc4"}),
     ("missing_sri", {"rule_id_contains": "integrity"}),
     ("missing_sri", {"rule_id_contains": "subresource"}),
@@ -567,7 +573,7 @@ _CLASSIFICATION_RULES: list[tuple[str, dict]] = [
 ]
 
 # Fallback for findings that don't match any classification
-_DEFAULT_TYPE = "dependency_cve_network"  # safe default
+_DEFAULT_TYPE = "general_security"
 
 # ---------------------------------------------------------------------------
 # REMEDIATION MAP — per finding-type remediation text
@@ -592,6 +598,8 @@ REMEDIATION_MAP: dict[str, str] = {
     "weak_hash": "Replace MD5/SHA-1 with SHA-256 or SHA-3 for hashing. Use bcrypt/argon2 for password storage.",
     "weak_rng": "Replace Math.random() with crypto.randomBytes() (Node.js) or SecureRandom (Java). Never use non-cryptographic RNG for security.",
     "hardcoded_crypto_key": "Move encryption keys to a key management system (KMS, Vault). Never hardcode keys in source code.",
+    "general_security": "Review the reported code and apply the scanner rule's specific mitigation after confirming the affected behavior.",
+    "crypto_misuse": "Review the cryptographic API and its key, nonce/IV, and authentication-tag handling. For AES-GCM, use a unique nonce for each encryption under the same key and verify the tag before using plaintext.",
     "weak_cipher": "Replace DES/RC4 with AES-256-GCM or ChaCha20-Poly1305. Avoid ECB mode — use GCM or CBC with HMAC.",
     # Injection
     "sql_injection": "Replace string concatenation in SQL queries with parameterized queries or an ORM that uses prepared statements.",
@@ -640,7 +648,7 @@ REMEDIATION_MAP: dict[str, str] = {
     # Data exposure
     "pii_in_source": "Remove the hardcoded PII from source code. Use environment variables, config files excluded from version control, or a secrets manager.",
     "pii_field_unencrypted": "Add column-level encryption (e.g. pgcrypto, Mongoose encrypt) for PII fields. Use AES-256-GCM or similar.",
-    "sensitive_category_data_detected": "Apply additional access controls and encryption for GDPR Art. 9 / DPDP Rule 4 special-category data fields.",
+    "sensitive_category_data_detected": "Review the applicable GDPR Article 9 processing condition and restrict access to special-category data. Assess general personal-data safeguards separately under DPDP.",
     # IaC
     "iac_storage_misconfigured": "Restrict public access to storage resources. Use bucket policies with least-privilege access and enable versioning.",
     "iac_network_exposed": "Restrict security group ingress to specific IP ranges. Never use 0.0.0.0/0 for sensitive ports.",
@@ -685,7 +693,7 @@ def _classify_finding_type(
 
     Returns _DEFAULT_TYPE if nothing matches.
     """
-    if preclassified:
+    if preclassified in CONTROL_MAP:
         return preclassified
 
     rid = rule_id.lower().strip() if rule_id else ""
@@ -702,7 +710,13 @@ def _classify_finding_type(
     if rid in _HARDCODED:
         return _HARDCODED[rid]
 
+    if rid in CONTROL_MAP:
+        return rid
+
     for type_key, matcher in _CLASSIFICATION_RULES:
+        pattern = matcher.get("rule_id_pattern")
+        if pattern and re.search(pattern, rid):
+            return type_key
         # Check exact match
         exact = matcher.get("rule_id_exact")
         if exact and rid == exact.lower():
@@ -763,223 +777,78 @@ def get_controls(
 # ---------------------------------------------------------------------------
 
 def _resolve_controls(findings: list[Finding]) -> dict[str, dict]:
-    """Resolve SOC2 and ISO controls for each finding by rule_id.
-
-    Returns dict mapping rule_id -> dict with soc2 and iso control info.
-    Only SOC2 and ISO are extracted (GDPR/DPDP come via curated table).
-    """
-    resolved: dict[str, dict] = {}
+    """Resolve each occurrence independently, including all mapped controls."""
+    resolved = {}
     for finding in findings:
         rule_id = finding.get("rule_id") or ""
-        if rule_id in resolved:
-            continue
         description = finding.get("description", "")
-        preclassified = finding.get("finding_type") if isinstance(finding, dict) else None
-        controls = get_controls(rule_id, description, preclassified)
-        soc2_control = iso_control = None
-        for c in controls:
-            if c["framework"] == "soc2":
-                soc2_control = c
-            elif c["framework"] == "iso27001":
-                iso_control = c
-        resolved[rule_id] = {
-            "description": finding.get("description", ""),
-            "soc2_control_id": soc2_control["control_id"] if soc2_control else None,
-            "soc2_control_name": soc2_control["control_name"] if soc2_control else None,
-            "iso_control_id": iso_control["control_id"] if iso_control else None,
-            "iso_control_name": iso_control["control_name"] if iso_control else None,
+        finding_type = _classify_finding_type(rule_id, description, finding.get("finding_type"))
+        resolved[finding_fingerprint(finding)] = {
+            "finding_type": finding_type,
+            "controls": [c for c in get_controls(rule_id, description, finding_type)
+                         if c["framework"] in {"soc2", "iso27001"}],
         }
     return resolved
 
 
-# ---------------------------------------------------------------------------
-# LLM BATCH — explanations only, never controls
-# ---------------------------------------------------------------------------
-
 CHUNK_SIZE = 5
 
 
-async def _batch_chunk(
-    client: AsyncGroq, chunk: list[dict]
-) -> list[dict] | None:
-    """Send one chunk of findings to Groq and return parsed explanations."""
+async def _batch_chunk(client: AsyncGroq, chunk: list[dict]) -> list[dict]:
     prompt = (
-        "You are a compliance expert. For each finding below, explain in 1 sentence why "
-        "it violates the mapped SOC2 and ISO27001 controls.\n"
-        "Return a JSON array where each item has: "
-        "rule_id, soc2_explanation, iso_explanation.\n"
-        "Only return valid JSON — no markdown, no extra text.\n"
+        "Explain in one sentence how each security finding category relates to its "
+        "mapped controls. These are potential gaps requiring review, not proven violations. "
+        "Return a JSON array with finding_id, soc2_explanation, iso_explanation. "
+        "Do not change controls or produce scores.\n"
         f"Findings: {json.dumps(chunk)}"
     )
-
     response = await groq_retry(
         lambda: client.chat.completions.create(
             model=LLM_MODEL, messages=[{"role": "user", "content": prompt}]
         )
     )
-    content = response.choices[0].message.content or ""
-    content = strip_markdown_fences(content)
-    return json.loads(content)
-
-
-async def _map_single_finding(
-    client: AsyncGroq, finding: Finding, info: dict
-) -> list[dict]:
-    """Fallback: per-finding Groq call for one finding's SOC2 + ISO."""
-    rule_id = finding.get("rule_id") or ""
-    soc2_id = info.get("soc2_control_id")
-    iso_id = info.get("iso_control_id")
-    soc2_name = info.get("soc2_control_name")
-    iso_name = info.get("iso_control_name")
-    description = finding.get("description", "")
-
-    results = []
-    for control_id, ctrl_name, framework, fw_key in [
-        (soc2_id, soc2_name, "soc2", "soc2"),
-        (iso_id, iso_name, "iso27001", "iso"),
-    ]:
-        if not control_id:
-            continue
-        try:
-            resp = await groq_retry(
-                lambda cid=control_id, cn=ctrl_name, fw=framework: client.chat.completions.create(
-                    model=LLM_MODEL,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Given this security finding: {description}\n"
-                                f"Explain in 1 sentence why it violates {fw.upper()} "
-                                f"control {cid} ({cn}). Be specific."
-                            ),
-                        }
-                    ],
-                ),
-                max_retries=2,
-            )
-            explanation = resp.choices[0].message.content or ""
-        except Exception:
-            explanation = "LLM call failed. Unable to generate explanation."
-
-        results.append(
-            {
-                "rule_id": rule_id,
-                f"{fw_key}_explanation": explanation,
-            }
-        )
-    return results
+    parsed = json.loads(strip_markdown_fences(response.choices[0].message.content or ""))
+    return parsed if isinstance(parsed, list) else []
 
 
 async def batch_map_findings_soc2_iso(findings: list[Finding]) -> list[MappedControl]:
     if not findings:
         return []
-
-    client = AsyncGroq(api_key=GROQ_API_KEY)
     resolved = _resolve_controls(findings)
-
-    # Build batch input — includes control_ids for LLM context but LLM only returns explanations
-    batch_input = []
-    for finding in findings:
-        rule_id = finding.get("rule_id") or ""
-        info = resolved.get(rule_id, {})
-        batch_input.append(
-            {
-                "rule_id": rule_id,
-                "description": info.get("description", finding.get("description", "")),
-                "soc2_control_id": info.get("soc2_control_id"),
-                "soc2_control_name": info.get("soc2_control_name"),
-                "iso_control_id": info.get("iso_control_id"),
-                "iso_control_name": info.get("iso_control_name"),
-            }
-        )
-
-    # Build a lookup map for findings by rule_id
-    findings_by_rule: dict[str, Finding] = {}
-    for f in findings:
-        rid = f.get("rule_id") or ""
-        findings_by_rule[rid] = f
-
-    # Chunk into smaller batches for reliable JSON responses
-    all_explanations: list[dict] = []
-    for i in range(0, len(batch_input), CHUNK_SIZE):
-        chunk = batch_input[i : i + CHUNK_SIZE]
-        try:
-            explanations = await _batch_chunk(client, chunk)
-            all_explanations.extend(explanations)
-        except Exception as exc:
-            logger.warning(
-                "Batch chunk %d/%d failed (%s), per-finding fallback",
-                i // CHUNK_SIZE + 1,
-                (len(batch_input) + CHUNK_SIZE - 1) // CHUNK_SIZE,
-                exc,
-            )
-            for entry in chunk:
-                rule_id = entry["rule_id"]
-                finding = findings_by_rule.get(rule_id)
-                if not finding:
-                    continue
-                info = resolved.get(rule_id, {})
-                single = await _map_single_finding(client, finding, info)
-                all_explanations.extend(single)
-
-    return _explanations_to_mapped_controls(all_explanations, findings)
+    # Only structured categories and control IDs reach the model, never source evidence.
+    batch_input = [{"finding_id": fingerprint, **info} for fingerprint, info in resolved.items()]
+    explanations = []
+    if GROQ_API_KEY:
+        client = AsyncGroq(api_key=GROQ_API_KEY)
+        for offset in range(0, len(batch_input), CHUNK_SIZE):
+            try:
+                explanations.extend(await _batch_chunk(client, batch_input[offset:offset + CHUNK_SIZE]))
+            except Exception as exc:
+                logger.info("Explanation enrichment unavailable: %s", type(exc).__name__)
+    return _explanations_to_mapped_controls(explanations, findings)
 
 
 def _explanations_to_mapped_controls(
     explanations: list[dict], findings: list[Finding]
 ) -> list[MappedControl]:
-    finding_map: dict[str, Finding] = {}
-    for f in findings:
-        rule_id = f.get("rule_id") or ""
-        if rule_id not in finding_map:
-            finding_map[rule_id] = f
-
-    mapped: list[MappedControl] = []
-    for item in explanations:
-        rule_id = item.get("rule_id", "")
-        finding = finding_map.get(rule_id)
-        if not finding:
-            continue
-
-        soc2_exp = item.get("soc2_explanation", "")
-        iso_exp = item.get("iso_explanation", "")
-
-        # ALWAYS use deterministic controls from the lookup table.
-        # The LLM only provides explanations; it never chooses the control_id.
-        description = finding.get("description", "")
-        preclassified = finding.get("finding_type") if isinstance(finding, dict) else None
-        resolved_controls = get_controls(rule_id, description, preclassified)
-        soc2_id = None
-        soc2_name = ""
-        iso_id = None
-        iso_name = ""
-        for c in resolved_controls:
-            if c["framework"] == "soc2":
-                soc2_id = c["control_id"]
-                soc2_name = c["control_name"]
-            elif c["framework"] == "iso27001":
-                iso_id = c["control_id"]
-                iso_name = c["control_name"]
-
-        if soc2_id and soc2_exp:
-            mapped.append(
-                {
-                    "finding": finding,
-                    "framework": "soc2",
-                    "control_id": soc2_id,
-                    "control_name": soc2_name,
-                    "explanation": soc2_exp,
-                }
-            )
-        if iso_id and iso_exp:
-            mapped.append(
-                {
-                    "finding": finding,
-                    "framework": "iso27001",
-                    "control_id": iso_id,
-                    "control_name": iso_name,
-                    "explanation": iso_exp,
-                }
-            )
-
+    by_finding = {item.get("finding_id"): item for item in explanations if isinstance(item, dict)}
+    resolved = _resolve_controls(findings)
+    mapped = []
+    for finding in findings:
+        fingerprint = finding_fingerprint(finding)
+        item = by_finding.get(fingerprint, {})
+        for control in resolved[fingerprint]["controls"]:
+            key = "soc2_explanation" if control["framework"] == "soc2" else "iso_explanation"
+            explanation = item.get(key)
+            if not isinstance(explanation, str) or not explanation.strip():
+                explanation = f"Review this finding against {control['control_name']} ({control['control_id']})."
+            mapped.append({
+                "finding": finding,
+                **control,
+                "explanation": explanation[:1200],
+                "confidence": float(finding.get("confidence", 0.8)),
+                "applicability": float(finding.get("applicability", 1.0)),
+                "personal_data_relevance": finding.get("personal_data_relevance", "unknown"),
+                "sources": [f"control_map:{control['control_id']}", f"scanner:{finding.get('tool', 'unknown')}"],
+            })
     return mapped
